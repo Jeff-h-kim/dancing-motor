@@ -5,34 +5,56 @@
 
 #define BUZZER_PIN 32
 
+const int channel = 0;
+const int resolution = 8;
+
+
 JsonDocument notes;
 JsonDocument music1;
 
 bool debug = false;
+int interval = 500;
 
 //-------- Functions ----------
-
-void playNote(String note, int duration, int gap) {
+void playNote(String note, float duration, String type, int interval) {
     if (!notes[note]) {
         Serial.println("Note not found: " + note);
         return;
     }
 
+    float length = 0.70;
+    float gap = 0.30;
+
+    if (type == "reg") {
+        length = 0.70;
+        gap = 0.30;
+    } else if (type == "stac") {
+        length = 0.40;
+        gap = 0.60;
+    } else if (type == "lega") {
+        length = 0.90;
+        gap = 0.10;
+    }
+
+    float totalTime = duration * interval;
+
+    // Handle rest
     if (notes[note] == "Rest") {
-      delay(duration);
-      if (debug) {
-        Serial.println(note);
-      }
-      
+        delay(totalTime);
+        return;
     }
 
     int freq = notes[note]["freq"].as<int>();
-    tone(BUZZER_PIN, freq, duration);
-    delay(duration + gap);
+
+    float playTime = totalTime * length;
+    float gapTime = totalTime * gap;
+
+    tone(BUZZER_PIN, freq, playTime);
+    delay(playTime + gapTime);
+
     if (debug) {
-      Serial.println(note);
+        Serial.println("Note: " + note + " | total duration: " + totalTime);
     }
-    
 }
 
 // --- load a song from a JSON string ---
@@ -46,23 +68,25 @@ bool loadSong(const char* songJson, JsonDocument& location) {
     return true;
 }
 
-void playSong (JsonDocument& sheetMusic) {
+void playSong (JsonDocument& sheetMusic, int interval) {
   JsonArray music_notes = sheetMusic["notes"];
 
   for (int i = 0; i < music_notes.size(); i++) {
     const char* pitch = music_notes[i]["note"];
-    const int length = music_notes[i]["duration"];
-    const int rest = music_notes[i]["gap"];
-    playNote(pitch, length, rest);
+    const float length = music_notes[i]["duration"];
+    const char* type = music_notes[i]["type"];
+    playNote(pitch, length, type, interval);
   }
 }
-
 
 void setup() {
   // put your setup code here, to run once:
   Serial.begin(115200);
-  while (!Serial) { delay(1000); } 
   delay(1000);   
+
+  ledcSetup(channel, 2000, resolution);
+  ledcAttachPin(BUZZER_PIN, channel);
+
   DeserializationError note_err = deserializeJson(notes, NOTES_JSON);
     if (note_err) {
         Serial.println("JSON parse failed: " + String(note_err.c_str()));
@@ -71,7 +95,11 @@ void setup() {
     Serial.println("Notes loaded OK");
 
     loadSong(MUSIC_JSON, music1);
-    playSong(music1);
+    int tempo = music1["tempo"].as<int>();
+
+    interval = 60000/tempo;
+    Serial.println(interval);
+    playSong(music1, interval);
 }
 
 void loop() {
