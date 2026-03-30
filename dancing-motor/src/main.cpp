@@ -1,13 +1,20 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include "notes.h"
-#include "music_files/test.h"
+#include "music_files/toothless_dancing.h"
+
 
 #define BUZZER_PIN 32
 
-const int channel = 0;
-const int resolution = 8;
+const int motorPin = 25;
+const int motorChannel = 1;
+const int motorResolution = 8;
+const int motorFreq = 1000;
 
+const int buzzerChannel = 0;
+const int buzzerResolution = 8;
+
+const int buttonPin = 33;
 
 JsonDocument notes;
 JsonDocument music1;
@@ -25,10 +32,7 @@ void playNote(String note, float duration, String type, int interval) {
     float length = 0.70;
     float gap = 0.30;
 
-    if (type == "reg") {
-        length = 0.70;
-        gap = 0.30;
-    } else if (type == "stac") {
+    if (type == "stac") {
         length = 0.40;
         gap = 0.60;
     } else if (type == "lega") {
@@ -45,12 +49,15 @@ void playNote(String note, float duration, String type, int interval) {
     }
 
     int freq = notes[note]["freq"].as<int>();
-
     float playTime = totalTime * length;
     float gapTime = totalTime * gap;
 
-    tone(BUZZER_PIN, freq, playTime);
-    delay(playTime + gapTime);
+    // Play note using PWM
+    ledcWriteTone(buzzerChannel, freq);  // start note
+    delay(playTime);
+    ledcWriteTone(buzzerChannel, 0);     // stop note
+
+    delay(gapTime);
 
     if (debug) {
         Serial.println("Note: " + note + " | total duration: " + totalTime);
@@ -84,8 +91,13 @@ void setup() {
   Serial.begin(115200);
   delay(1000);   
 
-  ledcSetup(channel, 2000, resolution);
-  ledcAttachPin(BUZZER_PIN, channel);
+  ledcSetup(motorChannel, motorFreq, motorResolution);
+  ledcAttachPin(motorPin, motorChannel);
+
+  ledcSetup(buzzerChannel, 2000, buzzerResolution); // initial freq doesn't matter
+  ledcAttachPin(BUZZER_PIN, buzzerChannel);
+
+  pinMode(buttonPin, INPUT_PULLUP);
 
   DeserializationError note_err = deserializeJson(notes, NOTES_JSON);
     if (note_err) {
@@ -99,10 +111,19 @@ void setup() {
 
     interval = 60000/tempo;
     Serial.println(interval);
-    playSong(music1, interval);
+    
+    
+
 }
 
 void loop() {
   // put your main code here, to run repeatedly:
+  if (digitalRead(buttonPin) == LOW) {  // pressed
+    ledcWrite(motorChannel, 200);
+    playSong(music1, interval);
+    ledcWrite(motorChannel, 0);
+    while(digitalRead(buttonPin) == LOW); // wait for release
+  }
+
 };
 
