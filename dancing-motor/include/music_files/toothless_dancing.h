@@ -1,5 +1,5 @@
 #pragma once
-const char *MUSIC_JSON = R"({
+const char *MELODY_JSON = R"({
     "title":            "Toothless Dancing",
     "tempo":            150,
     "default_duration": 140,
@@ -90,6 +90,55 @@ const char *MUSIC_JSON = R"({
                                                        { "note": "Eb4", "duration": 0.5, "type": "stac" }
 
 
+
+
+    ]
+})";
+
+const char *BASS_JSON = R"({
+    "title": "Toothless Dancing - Bass",
+    "tempo": 120,
+    "notes": [
+        { "note": "Rest",  "duration": 4.0, "type": "reg" },
+
+        { "note": "Rest",  "duration": 4.0, "type": "reg" },
+
+        { "note": "Ab3",  "duration": 1.0, "type": "stac" },
+        { "note": "Ab3",  "duration": 1.0, "type": "stac" },
+        { "note": "Bb3",  "duration": 1.0, "type": "stac" },
+        { "note": "Bb3",  "duration": 1.0, "type": "stac" },
+
+        { "note": "Eb4",  "duration": 1.0, "type": "stac" },
+        { "note": "Bb3",  "duration": 1.0, "type": "stac" },
+        { "note": "Eb3",  "duration": 1.0, "type": "stac" },
+        { "note": "Rest",  "duration": 1.0, "type": "reg" },
+
+        { "note": "Ab3",  "duration": 1.0, "type": "stac" },
+        { "note": "Ab3",  "duration": 1.0, "type": "stac" },
+        { "note": "Bb3",  "duration": 1.0, "type": "stac" },
+        { "note": "Bb3",  "duration": 1.0, "type": "stac" },
+
+        { "note": "Eb4",  "duration": 1.0, "type": "stac" },
+        { "note": "Rest",  "duration": 1.0, "type": "reg" },
+        { "note": "Rest",  "duration": 2.0, "type": "reg" },
+
+        { "note": "Bb3",  "duration": 1.0, "type": "stac" },
+        { "note": "Bb3",  "duration": 1.0, "type": "stac" },
+        { "note": "Eb4",  "duration": 1.0, "type": "stac" },
+        { "note": "Eb4",  "duration": 1.0, "type": "stac" },
+
+        { "note": "Bb3",  "duration": 1.0, "type": "stac" },
+        { "note": "Bb3",  "duration": 1.0, "type": "stac" },
+        { "note": "Eb4",  "duration": 1.0, "type": "stac" },
+        { "note": "Eb4",  "duration": 1.0, "type": "stac" },
+
+        { "note": "C4",  "duration": 1.0, "type": "stac" },
+        { "note": "C4",  "duration": 1.0, "type": "stac" },
+        { "note": "Rest",  "duration": 2.0, "type": "reg" },
+
+        { "note": "Eb4",  "duration": 4.0, "type": "reg" },
+
+        { "note": "Rest",  "duration": 4.0, "type": "reg" },
 
 
     ]

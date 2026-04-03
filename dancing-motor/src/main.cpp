@@ -3,127 +3,235 @@
 #include "notes.h"
 #include "music_files/toothless_dancing.h"
 
+// -------- Pin & Channel Config --------
+const int NUM_BUZZERS = 6;
+const int BUZZER_PINS[NUM_BUZZERS]     = { 32, 26, 27, 14, 12, 13 };
+const int BUZZER_CHANNELS[NUM_BUZZERS] = {  0,  2,  3,  4,  5,  6 };
 
-#define BUZZER_PIN 32
-
-const int motorPin = 25;
-const int motorChannel = 1;
+const int motorPin        = 19;
+const int motorChannel    = 1;
 const int motorResolution = 8;
-const int motorFreq = 1000;
+const int motorFreq       = 1000;
 
-const int buzzerChannel = 0;
 const int buzzerResolution = 8;
+const int buttonPin        = 33;
 
-const int buttonPin = 33;
+// -------- Buzzer State --------
+struct BuzzerState {
+    bool          active;
+    bool          inGap;
+    unsigned long startTime;
+    unsigned long playTime;
+    unsigned long gapTime;
+};
 
+BuzzerState buzzerStates[NUM_BUZZERS];
+
+// -------- Note table --------
 JsonDocument notes;
-JsonDocument music1;
 
-bool debug = false;
+// -------- Song Player --------
+struct SongPlayer {
+    bool          playing;
+    int           noteIndex;
+    int           channel;
+    JsonDocument* sheetMusic;
+};
+
+JsonDocument melodyDoc, bassDoc;
+
+const int NUM_VOICES = 2;
+SongPlayer voices[NUM_VOICES] = {
+    { false, 0, 0, &melodyDoc },
+    { false, 0, 2, &bassDoc   },
+};
+
 int interval = 500;
 
-//-------- Functions ----------
-void playNote(String note, float duration, String type, int interval) {
-    if (!notes[note]) {
-        Serial.println("Note not found: " + note);
-        return;
+// -------- Button State Machine --------
+bool buttonStableState = HIGH;
+bool lastReading       = HIGH;
+unsigned long lastDebounceTime = 0;
+const unsigned long debounceDelay = 50;
+
+// -----------------------------------------------------------------------
+void setBuzzerState(int ch, bool active, bool inGap,
+                    unsigned long playTime, unsigned long gapTime) {
+    buzzerStates[ch].active    = active;
+    buzzerStates[ch].inGap     = inGap;
+    buzzerStates[ch].playTime  = playTime;
+    buzzerStates[ch].gapTime   = gapTime;
+    buzzerStates[ch].startTime = millis();
+}
+
+// -----------------------------------------------------------------------
+void forceStopAll() {
+    for (int i = 0; i < NUM_BUZZERS; i++) {
+        ledcWriteTone(BUZZER_CHANNELS[i], 0);
+        buzzerStates[i].active = false;
+        buzzerStates[i].inGap  = false;
     }
 
-    float length = 0.70;
-    float gap = 0.30;
-
-    if (type == "stac") {
-        length = 0.40;
-        gap = 0.60;
-    } else if (type == "lega") {
-        length = 0.90;
-        gap = 0.10;
+    for (int i = 0; i < NUM_VOICES; i++) {
+        voices[i].playing   = false;
+        voices[i].noteIndex = 0;
     }
 
-    float totalTime = duration * interval;
+    ledcWrite(motorChannel, 0);
+}
 
-    // Handle rest
-    if (notes[note] == "Rest") {
-        delay(totalTime);
+// -----------------------------------------------------------------------
+void playNoteOnChannel(int channel, const char* note,
+                       float duration, const char* type) {
+    if (channel < 0 || channel >= NUM_BUZZERS) return;
+
+    float length = 0.70f, gap = 0.30f;
+    if      (strcmp(type, "stac") == 0) { length = 0.40f; gap = 0.60f; }
+    else if (strcmp(type, "lega") == 0) { length = 0.90f; gap = 0.10f; }
+
+    unsigned long totalTime = (unsigned long)(duration * interval);
+    unsigned long playTime  = (unsigned long)(totalTime * length);
+    unsigned long gapTime   = (unsigned long)(totalTime * gap);
+
+    if (strcmp(note, "Rest") == 0) {
+        ledcWriteTone(BUZZER_CHANNELS[channel], 0);
+        setBuzzerState(channel, true, true, 0, totalTime);
         return;
     }
 
     int freq = notes[note]["freq"].as<int>();
-    float playTime = totalTime * length;
-    float gapTime = totalTime * gap;
+    ledcWriteTone(BUZZER_CHANNELS[channel], freq);
+    setBuzzerState(channel, true, false, playTime, gapTime);
+}
 
-    // Play note using PWM
-    ledcWriteTone(buzzerChannel, freq);  // start note
-    delay(playTime);
-    ledcWriteTone(buzzerChannel, 0);     // stop note
+// -----------------------------------------------------------------------
+void updateBuzzers() {
+    unsigned long now = millis();
 
-    delay(gapTime);
+    for (int ch = 0; ch < NUM_BUZZERS; ch++) {
+        if (!buzzerStates[ch].active) continue;
 
-    if (debug) {
-        Serial.println("Note: " + note + " | total duration: " + totalTime);
+        unsigned long elapsed = now - buzzerStates[ch].startTime;
+
+        if (!buzzerStates[ch].inGap) {
+            if (elapsed >= buzzerStates[ch].playTime) {
+                ledcWriteTone(BUZZER_CHANNELS[ch], 0);
+                buzzerStates[ch].inGap = true;
+                buzzerStates[ch].startTime = now;
+            }
+        } else {
+            if (elapsed >= buzzerStates[ch].gapTime) {
+                buzzerStates[ch].active = false;
+            }
+        }
     }
 }
 
-// --- load a song from a JSON string ---
-bool loadSong(const char* songJson, JsonDocument& location) {
-    DeserializationError sheet_music_err = deserializeJson(location, songJson);
-    if (sheet_music_err) {
-        Serial.println("Failed to load song: " + String(sheet_music_err.c_str()));
-        return false;
-    }
-    Serial.println("Song loaded: " + String(location["title"].as<const char*>()));
-    return true;
+bool channelReady(int ch) {
+    return !buzzerStates[ch].active;
 }
 
-void playSong (JsonDocument& sheetMusic, int interval) {
-  JsonArray music_notes = sheetMusic["notes"];
+// -----------------------------------------------------------------------
+void updateSongPlayer(SongPlayer& sp) {
+    if (!sp.playing || sp.sheetMusic == nullptr) return;
+    if (!channelReady(sp.channel)) return;
 
-  for (int i = 0; i < music_notes.size(); i++) {
-    const char* pitch = music_notes[i]["note"];
-    const float length = music_notes[i]["duration"];
-    const char* type = music_notes[i]["type"];
-    playNote(pitch, length, type, interval);
-  }
-}
+    JsonArray music_notes = (*sp.sheetMusic)["notes"];
 
-void setup() {
-  // put your setup code here, to run once:
-  Serial.begin(115200);
-  delay(1000);   
-
-  ledcSetup(motorChannel, motorFreq, motorResolution);
-  ledcAttachPin(motorPin, motorChannel);
-
-  ledcSetup(buzzerChannel, 2000, buzzerResolution); // initial freq doesn't matter
-  ledcAttachPin(BUZZER_PIN, buzzerChannel);
-
-  pinMode(buttonPin, INPUT_PULLUP);
-
-  DeserializationError note_err = deserializeJson(notes, NOTES_JSON);
-    if (note_err) {
-        Serial.println("JSON parse failed: " + String(note_err.c_str()));
+    if (sp.noteIndex >= music_notes.size()) {
+        sp.playing = false;
         return;
     }
-    Serial.println("Notes loaded OK");
 
-    loadSong(MUSIC_JSON, music1);
-    int tempo = music1["tempo"].as<int>();
+    const char* pitch  = music_notes[sp.noteIndex]["note"];
+    float       length = music_notes[sp.noteIndex]["duration"];
+    const char* type   = music_notes[sp.noteIndex]["type"];
 
-    interval = 60000/tempo;
-    Serial.println(interval);
-    
-    
+    playNoteOnChannel(sp.channel, pitch, length, type);
+    sp.noteIndex++;
+}
+
+// -----------------------------------------------------------------------
+void startAllVoicesClean() {
+    forceStopAll();   // hard reset everything
+    delay(5);         // prevents PWM glitch on ESP32
+
+    for (int i = 0; i < NUM_VOICES; i++) {
+        voices[i].playing   = true;
+        voices[i].noteIndex = 0;
+    }
 
 }
 
+// -----------------------------------------------------------------------
+bool loadSong(const char* songJson, JsonDocument& location) {
+    return deserializeJson(location, songJson) == DeserializationError::Ok;
+}
+
+// -----------------------------------------------------------------------
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+
+    ledcSetup(motorChannel, motorFreq, motorResolution);
+    ledcAttachPin(motorPin, motorChannel);
+
+    for (int i = 0; i < NUM_BUZZERS; i++) {
+        ledcSetup(BUZZER_CHANNELS[i], 2000, buzzerResolution);
+        ledcAttachPin(BUZZER_PINS[i], BUZZER_CHANNELS[i]);
+        buzzerStates[i].active = false;
+    }
+
+    pinMode(buttonPin, INPUT_PULLUP);
+
+    deserializeJson(notes, NOTES_JSON);
+
+    loadSong(MELODY_JSON, melodyDoc);
+    loadSong(BASS_JSON,   bassDoc);
+
+    int tempo = melodyDoc["tempo"];
+    interval  = 60000 / tempo;
+}
+
+bool anySongPlaying() {
+    for (int i = 0; i < NUM_VOICES; i++) {
+        if (voices[i].playing) return true;
+    }
+    return false;
+}
+// -----------------------------------------------------------------------
 void loop() {
-  // put your main code here, to run repeatedly:
-  if (digitalRead(buttonPin) == LOW) {  // pressed
-    ledcWrite(motorChannel, 200);
-    playSong(music1, interval);
-    ledcWrite(motorChannel, 0);
-    while(digitalRead(buttonPin) == LOW); // wait for release
-  }
+    // -------- BUTTON HANDLING (ROBUST) --------
+    bool reading = digitalRead(buttonPin);
 
-};
+    if (reading != lastReading) {
+        lastDebounceTime = millis();
+    }
 
+    if ((millis() - lastDebounceTime) > debounceDelay) {
+        if (reading != buttonStableState) {
+            buttonStableState = reading;
+
+            if (buttonStableState == LOW) {
+                Serial.println("Clean press detected");
+                startAllVoicesClean();   // 🔥 interrupt + restart
+            }
+        }
+    }
+
+    lastReading = reading;
+
+    // -------- AUDIO ENGINE --------
+    updateBuzzers();
+
+    for (int i = 0; i < NUM_VOICES; i++) {
+        updateSongPlayer(voices[i]);
+    }
+
+    // -------- MOTOR CONTROL --------
+if (anySongPlaying()) {
+    ledcWrite(motorChannel, 200);  // ON
+} else {
+    ledcWrite(motorChannel, 0);    // OFF
+}
+}
