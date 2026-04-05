@@ -1,11 +1,313 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ArduinoJson.h>
+#include <secrets.h>
+#include "notes.h"
 
-This directory is intended for PlatformIO Test Runner and project tests.
 
-Unit Testing is a software testing method by which individual units of
-source code, sets of one or more MCU program modules together with associated
-control data, usage procedures, and operating procedures, are tested to
-determine whether they are fit for use. Unit testing finds problems early
-in the development cycle.
+// ===== SERVER =====
+WebServer server(80);
+int buzzerPin = 26;
 
-More information about PlatformIO Unit Testing:
-- https://docs.platformio.org/en/latest/advanced/unit-testing/index.html
+// ===== CHANNEL STORAGE =====
+String MELODY_JSON;
+String HARMONY1_JSON;
+String HARMONY2_JSON;
+String BASS1_JSON;
+String BASS2_JSON;
+String BASS3_JSON;
+
+bool lastButtonState = HIGH;
+
+// ===== HELPER: SAFE JSON BUILDER =====
+String convertChannel(const char* title, int tempo, JsonArray channel) {
+  String out = "{\n";
+  out += "  \"title\": \"" + String(title) + "\",\n";
+  out += "  \"tempo\": " + String(tempo) + ",\n";
+  out += "  \"notes\": [\n";
+
+  bool first = true;
+
+  for (JsonArray group : channel) {          // <-- each inner array
+    for (JsonObject note : group) {          // <-- actual notes
+
+      if (!first) out += ",\n";
+      first = false;
+
+      String n = note["note"] | "C4";
+float d  = note["duration"] | 1.0;
+String t = note["type"] | "reg";
+
+// 👇 ADD THIS
+String accidental = note["accidental"] | "";
+
+// Apply accidental to note name
+if (accidental == "sharp") {
+  n = n.substring(0, 1) + "#" + n.substring(1);
+}
+else if (accidental == "flat") {
+  n = n.substring(0, 1) + "b" + n.substring(1);
+}
+// natural = do nothing
+      out += "    { \"note\": \"" + n + "\", \"duration\": " + String(d, 2) + ", \"type\": \"" + t + "\" }";
+    }
+  }
+
+  out += "\n  ]\n}";
+  return out;
+}
+
+// ===== CORS HEADERS =====
+void sendCORS() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type, x-api-key");
+}
+
+// ===== PING =====
+void handlePing() {
+  sendCORS();
+  server.send(200, "text/plain", "pong");
+}
+
+// ===== OPTIONS =====
+void handleOptions() {
+  sendCORS();
+  server.send(204);
+}
+
+// ===== MAIN UPLOAD HANDLER =====
+void handleUpload() {
+  sendCORS();
+
+  // --- Handle preflight ---
+  if (server.method() == HTTP_OPTIONS) {
+    server.send(200);
+    return;
+  }
+
+  // --- API KEY CHECK ---
+  String key = "";
+
+  if (server.hasHeader("x-api-key")) key = server.header("x-api-key");
+  else if (server.hasHeader("X-API-KEY")) key = server.header("X-API-KEY");
+  else if (server.hasHeader("X-Api-Key")) key = server.header("X-Api-Key");
+
+  Serial.print("Received key: ");
+  Serial.println(key);
+
+  if (key != API_KEY) {
+    Serial.println("❌ Invalid API key");
+    server.send(401, "text/plain", "Unauthorized");
+    return;
+  }
+
+  // --- BODY CHECK ---
+  if (!server.hasArg("plain")) {
+    Serial.println("❌ No body received");
+    server.send(400, "text/plain", "No body");
+    return;
+  }
+
+  String body = server.arg("plain");
+
+  Serial.println("📥 Received JSON:");
+  Serial.println(body);
+
+  // --- PARSE JSON (BIG BUFFER) ---
+  StaticJsonDocument<16384> doc;
+
+  DeserializationError err = deserializeJson(doc, body);
+  if (err) {
+    Serial.print("❌ JSON parse failed: ");
+    Serial.println(err.c_str());
+    server.send(400, "text/plain", "Bad JSON");
+    return;
+  }
+
+  // --- VALIDATION ---
+  if (!doc.containsKey("tempo") ||
+      !doc.containsKey("treble") ||
+      !doc.containsKey("bass")) {
+    Serial.println("❌ Missing required fields");
+    server.send(400, "text/plain", "Missing fields");
+    return;
+  }
+
+  int tempo = doc["tempo"];
+
+  JsonArray treble = doc["treble"];
+  JsonArray bass   = doc["bass"];
+
+  if (treble.size() < 3 || bass.size() < 3) {
+    Serial.println("❌ Need 3 channels each");
+    server.send(400, "text/plain", "Need 3 channels each");
+    return;
+  }
+
+  // --- EXTRACT CHANNELS ---
+  JsonArray melodyNotes   = treble[0];
+  JsonArray harmony1Notes = treble[1];
+  JsonArray harmony2Notes = treble[2];
+
+  JsonArray bass1Notes = bass[0];
+  JsonArray bass2Notes = bass[1];
+  JsonArray bass3Notes = bass[2];
+
+  // --- CONVERT ---
+  MELODY_JSON   = convertChannel("Melody", tempo, melodyNotes);
+  HARMONY1_JSON = convertChannel("Harmony1", tempo, harmony1Notes);
+  HARMONY2_JSON = convertChannel("Harmony2", tempo, harmony2Notes);
+  BASS1_JSON    = convertChannel("Bass1", tempo, bass1Notes);
+  BASS2_JSON    = convertChannel("Bass2", tempo, bass2Notes);
+  BASS3_JSON    = convertChannel("Bass3", tempo, bass3Notes);
+
+  Serial.println("✅ Channels parsed successfully!");
+
+  // --- SUCCESS RESPONSE ---
+  server.send(200, "text/plain", "OK");
+}
+
+
+
+int getFreq(String note) {
+  StaticJsonDocument<4096> doc;
+  deserializeJson(doc, NOTES_JSON);
+
+  if (!doc.containsKey(note)) {
+    Serial.print("❌ Unknown note: ");
+    Serial.println(note);
+    return 0;
+  }
+
+  return doc[note]["freq"];
+}
+
+
+
+
+
+
+void playMelody() {
+  if (MELODY_JSON == "") {
+    Serial.println("❌ No melody loaded!");
+    return;
+  }
+
+  Serial.println("🎵 Playing melody...");
+
+  StaticJsonDocument<8192> doc;
+  DeserializationError err = deserializeJson(doc, MELODY_JSON);
+
+  if (err) {
+    Serial.println("❌ Melody JSON parse failed");
+    return;
+  }
+
+  JsonArray notes = doc["notes"];
+  int tempo = doc["tempo"] | 120;
+
+  // duration of a quarter note in ms
+  float beatMs = 60000.0 / tempo;
+
+  for (JsonObject n : notes) {
+    String note = n["note"];
+    float duration = n["duration"];
+    String type = n["type"] | "reg";
+
+    int freq = getFreq(note);
+
+    Serial.print("Playing: ");
+    Serial.println(note);
+
+    if (freq > 0) {
+      ledcWriteTone(0, freq);
+    } else {
+      ledcWriteTone(0, 0); // rest
+    }
+
+    int playTime = beatMs * duration;
+
+    if (type == "stac") {
+      delay(playTime * 0.5);
+      ledcWriteTone(0, 0);
+      delay(playTime * 0.5);
+    } else {
+      delay(playTime);
+    }
+
+    ledcWriteTone(0, 0); // stop between notes
+  }
+
+  Serial.println("✅ Done playing");
+}
+
+
+
+
+
+
+
+
+
+// ===== SETUP =====
+void setup() {
+  Serial.begin(115200);
+
+  Serial.println("TEST TONE START");
+ledcWriteTone(0, 1000);  // 1kHz
+delay(2000);
+ledcWriteTone(0, 0);
+Serial.println("TEST TONE END");
+
+
+
+pinMode(33, INPUT_PULLUP);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\n✅ Connected!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  // Routes
+  server.on("/ping", HTTP_GET, handlePing);
+  server.on("/upload", HTTP_OPTIONS, handleOptions);
+  server.on("/upload", HTTP_POST, handleUpload);
+
+  const char* headerKeys[] = {"x-api-key", "X-API-KEY", "X-Api-Key"};
+size_t headerKeysCount = sizeof(headerKeys) / sizeof(char*);
+server.collectHeaders(headerKeys, headerKeysCount);
+
+  server.begin();
+  Serial.println("🚀 Server started on port 80");
+
+  ledcSetup(0, 2000, 8);     // channel 0
+ledcAttachPin(buzzerPin, 0);
+
+
+
+
+
+
+}
+
+// ===== LOOP =====
+void loop() {
+  server.handleClient();
+
+  bool currentState = digitalRead(33);
+
+  // Detect press (HIGH → LOW)
+  if (lastButtonState == HIGH && currentState == LOW) {
+    Serial.println("▶ Button pressed - playing");
+    playMelody();
+  }
+
+  lastButtonState = currentState;
+}
