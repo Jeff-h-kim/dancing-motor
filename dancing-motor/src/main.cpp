@@ -1,237 +1,410 @@
-#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
 #include <ArduinoJson.h>
+#include <secrets.h>
 #include "notes.h"
-#include "music_files/toothless_dancing.h"
 
-// -------- Pin & Channel Config --------
-const int NUM_BUZZERS = 6;
-const int BUZZER_PINS[NUM_BUZZERS]     = { 32, 26, 27, 14, 12, 13 };
-const int BUZZER_CHANNELS[NUM_BUZZERS] = {  0,  2,  3,  4,  5,  6 };
-
-const int motorPin        = 19;
-const int motorChannel    = 1;
-const int motorResolution = 8;
-const int motorFreq       = 1000;
-
-const int buzzerResolution = 8;
-const int buttonPin        = 33;
-
-// -------- Buzzer State --------
-struct BuzzerState {
-    bool          active;
-    bool          inGap;
-    unsigned long startTime;
-    unsigned long playTime;
-    unsigned long gapTime;
+struct Channel {
+  JsonArray notes;
+  int index;
+  unsigned long nextChange;
+    unsigned long stopTime;
+  int pwmChannel;
+  int tempo;
 };
 
-BuzzerState buzzerStates[NUM_BUZZERS];
+// ===== SERVER =====
+WebServer server(80);
+int buzzerPins[6] = {15, 12, 14, 27, 26, 25};
+int pwmChannels[6] = {0, 1, 2, 3, 4, 5};
+Channel channels[6];
+StaticJsonDocument<8192> docs[6];
 
-// -------- Note table --------
-JsonDocument notes;
+int buttonPin = 33;
+int buttonChannel = 6;
 
-// -------- Song Player --------
-struct SongPlayer {
-    bool          playing;
-    int           noteIndex;
-    int           channel;
-    JsonDocument* sheetMusic;
-};
+int motorPin = 19;
+int motorChannel = 7;
 
-JsonDocument melodyDoc, bassDoc;
+// ===== CHANNEL STORAGE =====
+String MELODY1_JSON;
+String MELODY2_JSON;
+String MELODY3_JSON;
+String BASS1_JSON;
+String BASS2_JSON;
+String BASS3_JSON;
 
-const int NUM_VOICES = 2;
-SongPlayer voices[NUM_VOICES] = {
-    { false, 0, 0, &melodyDoc },
-    { false, 0, 2, &bassDoc   },
-};
+bool lastButtonState = HIGH;
 
-int interval = 500;
+// ===== HELPER: SAFE JSON BUILDER =====
+String convertChannel(const char* title, int tempo, JsonArray channel) {
+  String out = "{\n";
+  out += "  \"title\": \"" + String(title) + "\",\n";
+  out += "  \"tempo\": " + String(tempo) + ",\n";
+  out += "  \"notes\": [\n";
 
-// -------- Button State Machine --------
-bool buttonStableState = HIGH;
-bool lastReading       = HIGH;
-unsigned long lastDebounceTime = 0;
-const unsigned long debounceDelay = 50;
+  bool first = true;
 
-// -----------------------------------------------------------------------
-void setBuzzerState(int ch, bool active, bool inGap,
-                    unsigned long playTime, unsigned long gapTime) {
-    buzzerStates[ch].active    = active;
-    buzzerStates[ch].inGap     = inGap;
-    buzzerStates[ch].playTime  = playTime;
-    buzzerStates[ch].gapTime   = gapTime;
-    buzzerStates[ch].startTime = millis();
+  // --- Iterate directly over the notes in the channel ---
+  for (JsonObject note : channel) {
+    if (!first) out += ",\n";
+    first = false;
+
+    String n = note["note"] | "C4";
+    float d  = note["duration"] | 1.0;
+    String t = note["type"] | "reg";
+    String accidental = note["accidental"] | "";
+
+    // Apply accidental
+    if (accidental == "sharp") n = n.substring(0,1) + "#" + n.substring(1);
+    else if (accidental == "flat") n = n.substring(0,1) + "b" + n.substring(1);
+    // natural = do nothing
+
+    out += "    { \"note\": \"" + n + "\", \"duration\": " + String(d, 2) + ", \"type\": \"" + t + "\" }";
+  }
+
+  out += "\n  ]\n}";
+
+  // DEBUG: print converted JSON after returning it, not before
+  Serial.println("Converted channel JSON for " + String(title) + ":");
+  Serial.println(out);
+
+  return out;
 }
 
-// -----------------------------------------------------------------------
-void forceStopAll() {
-    for (int i = 0; i < NUM_BUZZERS; i++) {
-        ledcWriteTone(BUZZER_CHANNELS[i], 0);
-        buzzerStates[i].active = false;
-        buzzerStates[i].inGap  = false;
-    }
-
-    for (int i = 0; i < NUM_VOICES; i++) {
-        voices[i].playing   = false;
-        voices[i].noteIndex = 0;
-    }
-
-    ledcWrite(motorChannel, 0);
+// ===== CORS HEADERS =====
+void sendCORS() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type, x-api-key");
 }
 
-// -----------------------------------------------------------------------
-void playNoteOnChannel(int channel, const char* note,
-                       float duration, const char* type) {
-    if (channel < 0 || channel >= NUM_BUZZERS) return;
-
-    float length = 0.70f, gap = 0.30f;
-    if      (strcmp(type, "stac") == 0) { length = 0.40f; gap = 0.60f; }
-    else if (strcmp(type, "lega") == 0) { length = 0.90f; gap = 0.10f; }
-
-    unsigned long totalTime = (unsigned long)(duration * interval);
-    unsigned long playTime  = (unsigned long)(totalTime * length);
-    unsigned long gapTime   = (unsigned long)(totalTime * gap);
-
-    if (strcmp(note, "Rest") == 0) {
-        ledcWriteTone(BUZZER_CHANNELS[channel], 0);
-        setBuzzerState(channel, true, true, 0, totalTime);
-        return;
-    }
-
-    int freq = notes[note]["freq"].as<int>();
-    ledcWriteTone(BUZZER_CHANNELS[channel], freq);
-    setBuzzerState(channel, true, false, playTime, gapTime);
+// ===== PING =====
+void handlePing() {
+  sendCORS();
+  server.send(200, "text/plain", "pong");
 }
 
-// -----------------------------------------------------------------------
-void updateBuzzers() {
+// ===== OPTIONS =====
+void handleOptions() {
+  sendCORS();
+  server.send(204);
+}
+
+// ===== MAIN UPLOAD HANDLER =====
+void handleUpload() {
+  sendCORS();
+
+  // --- Handle preflight ---
+  if (server.method() == HTTP_OPTIONS) {
+    server.send(200);
+    return;
+  }
+
+  // --- API KEY CHECK ---
+  String key = "";
+
+  if (server.hasHeader("x-api-key")) key = server.header("x-api-key");
+  else if (server.hasHeader("X-API-KEY")) key = server.header("X-API-KEY");
+  else if (server.hasHeader("X-Api-Key")) key = server.header("X-Api-Key");
+
+  Serial.print("Received key: ");
+  Serial.println(key);
+
+  if (key != API_KEY) {
+    Serial.println("❌ Invalid API key");
+    server.send(401, "text/plain", "Unauthorized");
+    return;
+  }
+
+  // --- BODY CHECK ---
+  if (!server.hasArg("plain")) {
+    Serial.println("❌ No body received");
+    server.send(400, "text/plain", "No body");
+    return;
+  }
+
+  String body = server.arg("plain");
+
+  Serial.println("📥 Received JSON:");
+  Serial.println(body);
+
+  // --- PARSE JSON (BIG BUFFER) ---
+  StaticJsonDocument<16384> doc;
+
+  DeserializationError err = deserializeJson(doc, body);
+  if (err) {
+    Serial.print("❌ JSON parse failed: ");
+    Serial.println(err.c_str());
+    server.send(400, "text/plain", "Bad JSON");
+    return;
+  }
+
+  // --- VALIDATION ---
+  if (!doc.containsKey("tempo") ||
+      !doc.containsKey("treble") ||
+      !doc.containsKey("bass")) {
+    Serial.println("❌ Missing required fields");
+    server.send(400, "text/plain", "Missing fields");
+    return;
+  }
+
+  int tempo = doc["tempo"];
+
+  JsonArray treble = doc["treble"];
+  JsonArray bass   = doc["bass"];
+
+  if (treble.size() < 3 || bass.size() < 3) {
+    Serial.println("❌ Need 3 channels each");
+    server.send(400, "text/plain", "Need 3 channels each");
+    return;
+  }
+
+  // --- EXTRACT CHANNELS ---
+  JsonArray melody1Notes   = treble[0];
+  JsonArray melody2Notes = treble[1];
+  JsonArray melody3Notes = treble[2];
+
+  JsonArray bass1Notes = bass[0];
+  JsonArray bass2Notes = bass[1];
+  JsonArray bass3Notes = bass[2];
+
+  // --- CONVERT ---
+  MELODY1_JSON   = convertChannel("Melody1", tempo, melody1Notes);
+  MELODY2_JSON = convertChannel("Melody2", tempo, melody2Notes);
+  MELODY3_JSON = convertChannel("Melody3", tempo, melody3Notes);
+  BASS1_JSON    = convertChannel("Bass1", tempo, bass1Notes);
+  BASS2_JSON    = convertChannel("Bass2", tempo, bass2Notes);
+  BASS3_JSON    = convertChannel("Bass3", tempo, bass3Notes);
+
+  Serial.println("✅ Channels parsed successfully!");
+
+  // --- SUCCESS RESPONSE ---
+  server.send(200, "text/plain", "OK");
+}
+
+
+
+int getFreq(String note) {
+  StaticJsonDocument<4096> doc;
+  deserializeJson(doc, NOTES_JSON);
+
+  if (!doc.containsKey(note)) {
+    Serial.print("❌ Unknown note: ");
+    Serial.println(note);
+    return 0;
+  }
+
+  return doc[note]["freq"];
+}
+
+
+
+
+
+
+void playMelody() {
+  if (MELODY1_JSON == "") {
+    Serial.println("❌ No melody loaded!");
+    return;
+  }
+
+  Serial.println("🎵 Playing melody...");
+
+  StaticJsonDocument<8192> doc;
+  DeserializationError err = deserializeJson(doc, MELODY1_JSON);
+
+  if (err) {
+    Serial.println("❌ Melody JSON parse failed");
+    return;
+  }
+
+  JsonArray notes = doc["notes"];
+  int tempo = doc["tempo"] | 120;
+
+  // duration of a quarter note in ms
+  float beatMs = 60000.0 / tempo;
+
+  for (JsonObject n : notes) {
+    String note = n["note"];
+    float duration = n["duration"];
+    String type = n["type"] | "reg";
+
+    int freq = getFreq(note);
+
+    Serial.print("Playing: ");
+    Serial.println(note);
+
+    if (freq > 0) {
+      ledcWriteTone(0, freq);
+    } else {
+      ledcWriteTone(0, 0); // rest
+    }
+
+    int playTime = beatMs * duration;
+
+    if (type == "stac") {
+      delay(playTime * 0.5);
+      ledcWriteTone(0, 0);
+      delay(playTime * 0.5);
+    } else {
+      delay(playTime);
+    }
+
+    ledcWriteTone(0, 0); // stop between notes
+  }
+
+  Serial.println("✅ Done playing");
+}
+
+
+void startPlayback() {
+  const String jsons[6] = {
+    MELODY1_JSON, MELODY2_JSON, MELODY3_JSON,
+    BASS1_JSON, BASS2_JSON, BASS3_JSON
+  };
+
+  for (int i = 0; i < 6; i++) {
+    deserializeJson(docs[i], jsons[i]);
+
+    channels[i].notes = docs[i]["notes"];
+    channels[i].index = 0;
+    channels[i].nextChange = millis();
+    channels[i].pwmChannel = pwmChannels[i];
+    channels[i].tempo = docs[i]["tempo"] | 120;
+  }
+}
+
+void updatePlayback() {
     unsigned long now = millis();
 
-    for (int ch = 0; ch < NUM_BUZZERS; ch++) {
-        if (!buzzerStates[ch].active) continue;
+    for (int i = 0; i < 6; i++) {
+        Channel &ch = channels[i];
 
-        unsigned long elapsed = now - buzzerStates[ch].startTime;
+        // Stop note if its stopTime has passed
+        if (ch.stopTime > 0 && now >= ch.stopTime) {
+            ledcWriteTone(ch.pwmChannel, 0);
+            ch.stopTime = 0;  // reset
+        }
 
-        if (!buzzerStates[ch].inGap) {
-            if (elapsed >= buzzerStates[ch].playTime) {
-                ledcWriteTone(BUZZER_CHANNELS[ch], 0);
-                buzzerStates[ch].inGap = true;
-                buzzerStates[ch].startTime = now;
-            }
-        } else {
-            if (elapsed >= buzzerStates[ch].gapTime) {
-                buzzerStates[ch].active = false;
-            }
+        // Check if finished
+        if (ch.index >= ch.notes.size()) continue;
+
+        // Time to play next note
+        if (now >= ch.nextChange) {
+            JsonObject n = ch.notes[ch.index];
+
+            String note = n["note"];
+            float duration = n["duration"];  // in beats
+            String type = n["type"] | "reg";
+
+            int freq = getFreq(note);
+            float beatMs = 60000.0 / ch.tempo;
+            float totalMs = duration * beatMs;
+
+            // Determine actual note play time
+            float playMs;
+            if (type == "stac") playMs = totalMs * 0.5;   // staccato
+            else if (type == "legato") playMs = totalMs;  // legato
+            else playMs = totalMs * 0.8;                  // regular 80%
+
+            // Start note
+            if (freq > 0) ledcWriteTone(ch.pwmChannel, freq);
+
+            // Schedule stop
+            ch.stopTime = now + (unsigned long)playMs;
+
+            // Schedule next note
+            ch.nextChange = now + (unsigned long)totalMs;
+
+            Serial.print("CH ");
+            Serial.print(i);
+            Serial.print(" NOTE: ");
+            Serial.print(note);
+            Serial.print(" FREQ: ");
+            Serial.print(freq);
+            Serial.print(" TYPE: ");
+            Serial.print(type);
+            Serial.print(" PLAYMS: ");
+            Serial.println(playMs);
+
+            ch.index++;
         }
     }
 }
 
-bool channelReady(int ch) {
-    return !buzzerStates[ch].active;
-}
 
-// -----------------------------------------------------------------------
-void updateSongPlayer(SongPlayer& sp) {
-    if (!sp.playing || sp.sheetMusic == nullptr) return;
-    if (!channelReady(sp.channel)) return;
 
-    JsonArray music_notes = (*sp.sheetMusic)["notes"];
 
-    if (sp.noteIndex >= music_notes.size()) {
-        sp.playing = false;
-        return;
-    }
 
-    const char* pitch  = music_notes[sp.noteIndex]["note"];
-    float       length = music_notes[sp.noteIndex]["duration"];
-    const char* type   = music_notes[sp.noteIndex]["type"];
-
-    playNoteOnChannel(sp.channel, pitch, length, type);
-    sp.noteIndex++;
-}
-
-// -----------------------------------------------------------------------
-void startAllVoicesClean() {
-    forceStopAll();   // hard reset everything
-    delay(5);         // prevents PWM glitch on ESP32
-
-    for (int i = 0; i < NUM_VOICES; i++) {
-        voices[i].playing   = true;
-        voices[i].noteIndex = 0;
-    }
-
-}
-
-// -----------------------------------------------------------------------
-bool loadSong(const char* songJson, JsonDocument& location) {
-    return deserializeJson(location, songJson) == DeserializationError::Ok;
-}
-
-// -----------------------------------------------------------------------
+// ===== SETUP =====
 void setup() {
-    Serial.begin(115200);
-    delay(1000);
+  Serial.begin(115200);
 
-    ledcSetup(motorChannel, motorFreq, motorResolution);
-    ledcAttachPin(motorPin, motorChannel);
+pinMode(33, INPUT_PULLUP);
 
-    for (int i = 0; i < NUM_BUZZERS; i++) {
-        ledcSetup(BUZZER_CHANNELS[i], 2000, buzzerResolution);
-        ledcAttachPin(BUZZER_PINS[i], BUZZER_CHANNELS[i]);
-        buzzerStates[i].active = false;
-    }
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-    pinMode(buttonPin, INPUT_PULLUP);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
 
-    deserializeJson(notes, NOTES_JSON);
+  Serial.println("\n✅ Connected!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
 
-    loadSong(MELODY_JSON, melodyDoc);
-    loadSong(BASS_JSON,   bassDoc);
+  // Routes
+  server.on("/ping", HTTP_GET, handlePing);
+  server.on("/upload", HTTP_OPTIONS, handleOptions);
+  server.on("/upload", HTTP_POST, handleUpload);
 
-    int tempo = melodyDoc["tempo"];
-    interval  = 60000 / tempo;
+  const char* headerKeys[] = {"x-api-key", "X-API-KEY", "X-Api-Key"};
+size_t headerKeysCount = sizeof(headerKeys) / sizeof(char*);
+server.collectHeaders(headerKeys, headerKeysCount);
+
+  server.begin();
+  Serial.println("🚀 Server started on port 80");
+
+for (int i = 0; i < 6; i++) {
+  ledcSetup(pwmChannels[i], 2000, 8);
+  ledcAttachPin(buzzerPins[i], pwmChannels[i]);
 }
 
-bool anySongPlaying() {
-    for (int i = 0; i < NUM_VOICES; i++) {
-        if (voices[i].playing) return true;
-    }
-    return false;
+Serial.println("BOOT");
+
+ pinMode(motorPin, OUTPUT);  // <-- Make sure the pin is OUTPUT
+  digitalWrite(motorPin, LOW);
+Serial.println("Testing motor...");
+  digitalWrite(motorPin, HIGH);  // motor on
+  delay(500);
+  digitalWrite(motorPin, LOW);   // motor off
+  Serial.println("Motor test done");
+
 }
-// -----------------------------------------------------------------------
+
+// ===== LOOP =====
 void loop() {
-    // -------- BUTTON HANDLING (ROBUST) --------
-    bool reading = digitalRead(buttonPin);
+  server.handleClient();
 
-    if (reading != lastReading) {
-        lastDebounceTime = millis();
-    }
+  bool currentState = digitalRead(33);
 
-    if ((millis() - lastDebounceTime) > debounceDelay) {
-        if (reading != buttonStableState) {
-            buttonStableState = reading;
+  if (currentState == LOW) {
+    // Button just pressed
+    Serial.println("BUTTON PRESSED!");
 
-            if (buttonStableState == LOW) {
-                Serial.println("Clean press detected");
-                startAllVoicesClean();   // 🔥 interrupt + restart
-            }
-        }
-    }
+    // --- Motor & buzzer test (already working) ---
+    digitalWrite(motorPin, HIGH);   // motor on
+    delay(500);
+    digitalWrite(motorPin, LOW);    // motor off
 
-    lastReading = reading;
+    // --- Start music playback ---
+    startPlayback();   // prepare channels
+    Serial.println("🎶 Starting music playback...");
+  }
 
-    // -------- AUDIO ENGINE --------
-    updateBuzzers();
+  lastButtonState = currentState;
 
-    for (int i = 0; i < NUM_VOICES; i++) {
-        updateSongPlayer(voices[i]);
-    }
-
-    // -------- MOTOR CONTROL --------
-if (anySongPlaying()) {
-    ledcWrite(motorChannel, 200);  // ON
-} else {
-    ledcWrite(motorChannel, 0);    // OFF
-}
+  updatePlayback();  // 🔥 THIS runs constantly
 }
